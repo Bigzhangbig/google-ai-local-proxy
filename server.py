@@ -116,7 +116,7 @@ def _convert_openai_content_parts(content):
                 mime = header[5:].split(";")[0] or "application/octet-stream"
                 parts.append({"inlineData": {"mimeType": mime, "data": payload}})
             elif isinstance(url, str) and url:
-                parts.append({"fileData": {"mimeType": "image/*", "fileUri": url}})
+                parts.append({"fileData": {"mimeType": "image/jpeg", "fileUri": url}})
             else:
                 parts.append({"text": "[image]"})
     return parts
@@ -302,7 +302,7 @@ def call_google(key, model, body, via_cf=True, stream=False, action=None, url_mo
     else:
         url = f"https://generativelanguage.googleapis.com/{api_version}/models/{google_url_model}:{action}"
         headers = {"Content-Type": "application/json", "x-goog-api-key": key}
-    resp = requests.post(url, headers=headers, json=body, timeout=TIMEOUT)
+    resp = requests.post(url, headers=headers, json=body, timeout=TIMEOUT, stream=stream)
     return resp
 
 
@@ -455,8 +455,9 @@ def chat_completions():
     is_stream = body.get("stream", False)
     model = body.get("model", "gemini-2.5-flash")
     google_body = openai_to_google(body)
+    api_version = "v1" if request.path.startswith("/v1/openai/") else "v1beta"
 
-    resp, used_model, key_hint = call_chain(google_body, model, stream=is_stream)
+    resp, used_model, key_hint = call_chain(google_body, model, stream=is_stream, api_version=api_version)
     if resp is None:
         return jsonify({"error": {"message": "All keys exhausted", "type": "fallback_exhausted"}}), 503
 
