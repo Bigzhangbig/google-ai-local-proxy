@@ -285,14 +285,14 @@ def openai_to_google(body):
     return google_body
 
 
-def call_google(key, model, body, via_cf=True, stream=False, action=None, url_model=None):
+def call_google(key, model, body, via_cf=True, stream=False, action=None, url_model=None, api_version="v1beta"):
     """model is for body/display, url_model is for URL path (defaults to model)."""
     if action is None:
         action = "streamGenerateContent" if stream else "generateContent"
     google_url_model = url_model or model
     if via_cf and CF_API_TOKEN:
         url = (f"https://gateway.ai.cloudflare.com/v1/{CF_ACCOUNT_ID}/{CF_GATEWAY_ID}/"
-               f"google-ai-studio/v1beta/models/{google_url_model}:{action}"
+               f"google-ai-studio/{api_version}/models/{google_url_model}:{action}"
                f"{'?alt=sse' if stream else ''}")
         headers = {
             "Content-Type": "application/json",
@@ -300,18 +300,16 @@ def call_google(key, model, body, via_cf=True, stream=False, action=None, url_mo
             "Authorization": f"Bearer {CF_API_TOKEN}",
         }
     else:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{google_url_model}:{action}"
+        url = f"https://generativelanguage.googleapis.com/{api_version}/models/{google_url_model}:{action}"
         headers = {"Content-Type": "application/json", "x-goog-api-key": key}
     resp = requests.post(url, headers=headers, json=body, timeout=TIMEOUT)
     return resp
 
 
-def call_chain(body, model=None, via_cf=True, stream=False):
+def call_chain(body, model=None, via_cf=True, stream=False, api_version="v1beta"):
     """Try all keys in round-robin order. Returns (Response, model, key_hint)."""
     global req_count
-    global req_count
     start_idx = req_count % len(API_KEYS)
-    req_count += 1
     req_count += 1
     for offset in range(len(API_KEYS)):
         idx = (start_idx + offset) % len(API_KEYS)
@@ -319,7 +317,7 @@ def call_chain(body, model=None, via_cf=True, stream=False):
         key_hint = key[:10] + "..."
         t0 = time.time()
         try:
-            resp = call_google(key, model, body, via_cf, stream)
+            resp = call_google(key, model, body, via_cf, stream, api_version=api_version)
             duration = int((time.time() - t0) * 1000)
             status = resp.status_code
             log_request("POST", request.path, model, status, duration, key_hint)
@@ -495,7 +493,8 @@ def handle_google_native(model, stream):
     except:
         return jsonify({"error": {"message": "Invalid JSON"}}), 400
 
-    resp, used_model, key_hint = call_chain(body, model, stream=stream)
+    api_version = "v1" if request.path.startswith("/v1/models/") else "v1beta"
+    resp, used_model, key_hint = call_chain(body, model, stream=stream, api_version=api_version)
     if resp is None:
         return jsonify({"error": {"message": "All keys exhausted", "type": "fallback_exhausted"}}), 503
 
@@ -517,6 +516,7 @@ def _stream_response(google_resp, model):
     first = True
     finish_sent = False
     tool_call_index = 0
+    completion_id = f"chatcmpl-{random.randint(10**24, 10**25)}"
     for line in google_resp.iter_lines():
         if not line:
             continue
@@ -563,7 +563,7 @@ def _stream_response(google_resp, model):
                 delta["content"] = text
             if stream_tool_calls:
                 delta["tool_calls"] = stream_tool_calls
-            chunk = {"id": f"chatcmpl-{random.randint(10**24, 10**25)}",
+            chunk = {"id": completion_id,
                      "object": "chat.completion.chunk",
                      "created": int(time.time()), "model": model,
                      "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
@@ -575,7 +575,7 @@ def _stream_response(google_resp, model):
                 delta["content"] = text
             if stream_tool_calls:
                 delta["tool_calls"] = stream_tool_calls
-            chunk = {"id": f"chatcmpl-{random.randint(10**24, 10**25)}",
+            chunk = {"id": completion_id,
                      "object": "chat.completion.chunk",
                      "created": int(time.time()), "model": model,
                      "choices": [{"index": 0, "delta": delta,
@@ -583,13 +583,13 @@ def _stream_response(google_resp, model):
             yield f"data: {json.dumps(chunk)}\n\n"
         if finish:
             finish_sent = True
-            chunk = {"id": f"chatcmpl-{random.randint(10**24, 10**25)}",
+            chunk = {"id": completion_id,
                      "object": "chat.completion.chunk",
                      "created": int(time.time()), "model": model,
                      "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason or "stop"}]}
             yield f"data: {json.dumps(chunk)}\n\n"
             if usage:
-                usage_chunk = {"id": f"chatcmpl-{random.randint(10**24, 10**25)}",
+                usage_chunk = {"id": completion_id,
                               "object": "chat.completion.chunk",
                               "created": int(time.time()), "model": model,
                               "choices": [], "usage": {
@@ -598,7 +598,7 @@ def _stream_response(google_resp, model):
                                   "total_tokens": usage.get("totalTokenCount", 0)}}
                 yield f"data: {json.dumps(usage_chunk)}\n\n"
     if not finish_sent:
-        chunk = {"id": f"chatcmpl-{random.randint(10**24, 10**25)}",
+        chunk = {"id": completion_id,
                  "object": "chat.completion.chunk",
                  "created": int(time.time()), "model": model,
                  "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
