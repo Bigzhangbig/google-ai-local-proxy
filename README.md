@@ -23,8 +23,17 @@ uv run python server.py
 | 格式 | 端点 |
 |------|------|
 | OpenAI | `POST /v1/chat/completions` |
-| Google | `POST /v1beta/models/{model}:generateContent` |
-| Streaming | `POST /v1/chat/completions?stream=true` / `/v1beta/models/{model}:streamGenerateContent` |
+| OpenAI 兼容别名 | `POST /v1/openai/chat/completions` / `POST /v1beta/openai/chat/completions` |
+| Google | `POST /v1beta/models/{model}:generateContent` / `POST /v1/models/{model}:generateContent` |
+| Streaming | `POST /v1/chat/completions` (body: `stream=true`) / `/v1beta/models/{model}:streamGenerateContent` / `/v1/models/{model}:streamGenerateContent` |
+
+### OpenAI 转 Gemini 兼容增强
+
+- 支持 `systemInstruction` 映射（system 消息不再拼接到首条 user 消息）
+- 支持 `temperature` / `top_p` / `top_k` / `max_tokens` / `stop` / `n` → `generationConfig`
+- 支持 `response_format` JSON 输出映射
+- 支持 `tools` / `tool_choice` 与 Gemini function calling 转换
+- 支持多模态 `image_url`（data URL 与 URI）
 
 ## 路由策略
 
