@@ -52,7 +52,7 @@ if not API_KEYS:
 
 PRIMARY_MODELS = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-3-flash-preview"]
 FALLBACK_MODELS = ["gemini-2.5-flash", "gemma-4-31b-it", "gemma-4-26b-a4b-it"]
-ALL_MODELS = PRIMARY_MODELS + FALLBACK_MODELS + ["gemini-embedding-2"]
+ALL_MODELS = PRIMARY_MODELS + FALLBACK_MODELS + ["gemini-embedding-2", "text-embedding-3-small"]
 AUTO_MODEL = "auto"
 
 def is_auto_model(model):
@@ -606,8 +606,16 @@ def embeddings():
     if isinstance(input_texts, str):
         input_texts = [input_texts]
 
+    # Map embedding model names → gemini-embedding-2-preview (the actual model name)
+    EMBED_MODEL_MAP = {
+        "embedding-2": "gemini-embedding-2-preview",
+        "gemini-embedding-2": "gemini-embedding-2-preview",
+        "text-embedding-3-small": "gemini-embedding-2-preview",
+    }
+    google_model = EMBED_MODEL_MAP.get(model, model)
+
     gemini_body = {
-        "requests": [{"model": f"models/{model}", "content": {"parts": [{"text": str(t)}]}}
+        "requests": [{"model": f"models/{google_model}", "content": {"parts": [{"text": str(t)}]}}
                      for t in input_texts]
     }
 
@@ -619,7 +627,7 @@ def embeddings():
         key_hint = key[:10] + "..."
         t0 = time.time()
         try:
-            resp = call_google(key, model, gemini_body, action="batchEmbedContents", stream=False)
+            resp = call_google(key, google_model, gemini_body, action="batchEmbedContents", stream=False)
             duration = int((time.time() - t0) * 1000)
             log_req("POST", "/v1/embeddings", model, resp.status_code, duration, key_hint)
             if resp.ok:
