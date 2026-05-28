@@ -52,7 +52,7 @@ if not API_KEYS:
 
 PRIMARY_MODELS = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-3-flash-preview"]
 FALLBACK_MODELS = ["gemini-2.5-flash", "gemma-4-31b-it", "gemma-4-26b-a4b-it"]
-ALL_MODELS = PRIMARY_MODELS + FALLBACK_MODELS + ["gemini-embedding-2", "text-embedding-3-small"]
+ALL_MODELS = PRIMARY_MODELS + FALLBACK_MODELS + ["gemini-embedding-2", "text-embedding-3-small", "text-embedding-3-large"]
 AUTO_MODEL = "auto"
 
 def is_auto_model(model):
@@ -611,6 +611,7 @@ def embeddings():
         "embedding-2": "gemini-embedding-2-preview",
         "gemini-embedding-2": "gemini-embedding-2-preview",
         "text-embedding-3-small": "gemini-embedding-2-preview",
+        "text-embedding-3-large": "gemini-embedding-2-preview",
     }
     google_model = EMBED_MODEL_MAP.get(model, model)
 
