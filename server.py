@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Local LLM Proxy — multi-key round-robin fallback
-OpenAI compatible: /v1/chat/completions
-Google native:     /v1beta/models/{model}:generateContent
+Local LLM Proxy — multi-key × multi-model fallback
+OpenAI:  /v1/chat/completions, /v1/embeddings
+Google:  /v1beta/models/{model}:generateContent|streamGenerateContent|batchEmbedContents
 """
 import os
+import sys
 import json
 import time
 import random
@@ -15,284 +16,101 @@ import requests
 app = Flask(__name__)
 
 # ── Config ──────────────────────────────────────────────────────────────────
-API_KEYS = os.environ.get("GOOGLE_API_KEYS", "").split(",")
-AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "local-dev-token")
+def load_env(path=".env"):
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
+load_env(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+API_KEYS = [k.strip() for k in os.environ.get("GOOGLE_API_KEYS", "").split(",") if k.strip()]
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "sk-proxy-kimi")
 PORT = int(os.environ.get("PORT", 18080))
+TIMEOUT = int(os.environ.get("TIMEOUT", 15))
 
-if len(API_KEYS) == 1 and API_KEYS[0] == "":
-    raise ValueError("Set GOOGLE_API_KEYS env var (comma-separated)")
+CF_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+CF_GATEWAY_ID = os.environ.get("CLOUDFLARE_GATEWAY_ID", "")
+CF_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
 
-CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "6b88a7cbdb5322b3c89342b38406f2b9")
-CF_GATEWAY_ID = os.environ.get("CF_GATEWAY_ID", "gemma-aggregation")
-CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")
+# Fallback from .env individual keys if GOOGLE_API_KEYS not set
+if not API_KEYS:
+    for i in range(1, 10):
+        k = os.environ.get(f"GOOGLE_API_KEY_{i}", "")
+        if k:
+            API_KEYS.append(k)
 
-TIMEOUT = 15
+if not API_KEYS:
+    print("ERROR: No API keys. Set GOOGLE_API_KEYS or GOOGLE_API_KEY_1..N", file=sys.stderr)
+    sys.exit(1)
+
+PRIMARY_MODELS = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-3-flash-preview"]
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemma-4-31b-it", "gemma-4-26b-a4b-it"]
+ALL_MODELS = PRIMARY_MODELS + FALLBACK_MODELS + ["gemini-embedding-2"]
+AUTO_MODEL = "auto"
+
+def is_auto_model(model):
+    return not model or model == AUTO_MODEL or model == "gemini-auto"
+
+FINISH_MAP = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "content_filter",
+              "RECITATION": "content_filter", "OTHER": "stop"}
+
 # ── State ────────────────────────────────────────────────────────────────────
-req_count = 0  # simple round-robin counter (int, not guarded — occasional dup OK)
-request_log = []  # [(ts, method, path, model, status, duration_ms, key_hint), ...]
+req_count = 0
+request_log = []
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
-def log_request(method, path, model, status, duration_ms, key_hint):
+def log_req(method, path, model, status, duration_ms, key_hint):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     request_log.append((ts, method, path, model, status, duration_ms, key_hint))
-    if len(request_log) > 200:
+    if len(request_log) > 500:
         request_log.pop(0)
-    print(f"[{ts}] {status:3d} {method:4s} {path[:50]} {model or ''} {duration_ms}ms")
+    print(f"[{ts}] {status:3d} {method:4s} {path[:60]} {model or ''} {duration_ms}ms")
 
 
-def next_key():
+def next_key_offset():
     global req_count
     idx = req_count % len(API_KEYS)
     req_count += 1
-    return API_KEYS[idx]
+    return idx
 
 
 def auth_check():
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {AUTH_TOKEN}":
-        return Response(json.dumps({"error": {"message": "Unauthorized"}}), 401,
-                        mimetype="application/json")
+        return jsonify({"error": {"message": "Unauthorized", "type": "auth_error"}}), 401
     return None
 
 
-FINISH_MAP = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "content_filter",
-              "RECITATION": "content_filter", "OTHER": "stop"}
+def cors_headers(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return resp
 
 
-def _as_text(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        chunks = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                chunks.append(part.get("text", ""))
-        return "".join(chunks)
-    return ""
+def json_resp(data, status=200, extra_headers=None):
+    resp = jsonify(data)
+    resp.status_code = status
+    cors_headers(resp)
+    if extra_headers:
+        for k, v in extra_headers.items():
+            resp.headers[k] = v
+    return resp
 
 
-def _parse_openai_tool_arguments(arguments):
-    if isinstance(arguments, dict):
-        return arguments
-    if isinstance(arguments, str):
-        try:
-            return json.loads(arguments)
-        except Exception:
-            return {"raw": arguments}
-    return {}
-
-
-def _parse_tool_message_content(content):
-    if isinstance(content, dict):
-        return content
-    if isinstance(content, str):
-        try:
-            return json.loads(content)
-        except Exception:
-            return {"content": content}
-    return {"content": _as_text(content)}
-
-
-def _convert_openai_content_parts(content):
-    parts = []
-    if isinstance(content, str):
-        return [{"text": content}]
-    if not isinstance(content, list):
-        return parts
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        p_type = part.get("type")
-        if p_type == "text":
-            parts.append({"text": part.get("text", "")})
-        elif p_type == "image_url":
-            image_url = part.get("image_url", {})
-            if isinstance(image_url, str):
-                url = image_url
-            else:
-                url = image_url.get("url", "")
-            if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
-                header, payload = url.split(",", 1)
-                mime = header[5:].split(";")[0] or "application/octet-stream"
-                parts.append({"inlineData": {"mimeType": mime, "data": payload}})
-            elif isinstance(url, str) and url:
-                parts.append({"fileData": {"mimeType": "image/jpeg", "fileUri": url}})
-            else:
-                parts.append({"text": "[image]"})
-    return parts
-
-
-def _build_generation_config(openai_body):
-    generation_config = {}
-    if openai_body.get("temperature") is not None:
-        generation_config["temperature"] = openai_body["temperature"]
-    if openai_body.get("top_p") is not None:
-        generation_config["topP"] = openai_body["top_p"]
-    if openai_body.get("top_k") is not None:
-        generation_config["topK"] = openai_body["top_k"]
-    if openai_body.get("max_tokens") is not None:
-        generation_config["maxOutputTokens"] = openai_body["max_tokens"]
-    if openai_body.get("n") is not None:
-        generation_config["candidateCount"] = openai_body["n"]
-    stop = openai_body.get("stop")
-    if isinstance(stop, str):
-        generation_config["stopSequences"] = [stop]
-    elif isinstance(stop, list):
-        generation_config["stopSequences"] = [item for item in stop if isinstance(item, str)]
-
-    response_format = openai_body.get("response_format", {})
-    if isinstance(response_format, dict):
-        rf_type = response_format.get("type")
-        if rf_type == "json_object":
-            generation_config["responseMimeType"] = "application/json"
-        elif rf_type == "json_schema":
-            generation_config["responseMimeType"] = "application/json"
-            schema = response_format.get("json_schema", {})
-            if isinstance(schema, dict):
-                generation_config["responseSchema"] = schema.get("schema", schema)
-
-    return generation_config
-
-
-def _build_tool_config(tool_choice):
-    if tool_choice is None:
-        return None
-    if isinstance(tool_choice, str):
-        if tool_choice == "none":
-            return {"functionCallingConfig": {"mode": "NONE"}}
-        if tool_choice == "required":
-            return {"functionCallingConfig": {"mode": "ANY"}}
-        return {"functionCallingConfig": {"mode": "AUTO"}}
-    if isinstance(tool_choice, dict):
-        name = tool_choice.get("function", {}).get("name", "")
-        if name:
-            return {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [name]}}
-    return None
-
-
-def _build_tools(openai_tools):
-    declarations = []
-    for tool in openai_tools or []:
-        if not isinstance(tool, dict) or tool.get("type") != "function":
-            continue
-        fn = tool.get("function", {})
-        name = fn.get("name")
-        if not name:
-            continue
-        declarations.append({
-            "name": name,
-            "description": fn.get("description", ""),
-            "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
-        })
-    if not declarations:
-        return None
-    return [{"functionDeclarations": declarations}]
-
-
-def to_openai(google_resp, model):
-    c = google_resp.get("candidates", [{}])[0]
-    usage = google_resp.get("usageMetadata", {})
-    finish = c.get("finishReason") or "STOP"
-    parts = c.get("content", {}).get("parts", [])
-    text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text"))
-    tool_calls = []
-    for idx, part in enumerate(parts):
-        if not isinstance(part, dict):
-            continue
-        fn_call = part.get("functionCall", {})
-        name = fn_call.get("name")
-        if not name:
-            continue
-        args = fn_call.get("args", {})
-        tool_calls.append({
-            "id": f"call_{random.randint(10**8, 10**10)}_{idx}",
-            "type": "function",
-            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
-        })
-    finish_reason = FINISH_MAP.get(finish, "stop")
-    if tool_calls and finish_reason == "stop":
-        finish_reason = "tool_calls"
-    message = {"role": "assistant", "content": text if text else None}
-    if tool_calls:
-        message["tool_calls"] = tool_calls
-    return {
-        "id": f"chatcmpl-{random.randint(10**24, 10**25)}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": {"prompt_tokens": usage.get("promptTokenCount", 0),
-                  "completion_tokens": usage.get("candidatesTokenCount", 0),
-                  "total_tokens": usage.get("totalTokenCount", 0)},
-    }
-
-
-def openai_to_google(body):
-    """Convert OpenAI messages → Google contents format."""
-    contents = []
-    system_parts = []
-    tool_call_id_to_name = {}
-    for msg in body.get("messages", []):
-        role = msg.get("role")
-        if role == "system":
-            system_text = _as_text(msg.get("content", ""))
-            if system_text:
-                system_parts.append({"text": system_text})
-            continue
-        parts = _convert_openai_content_parts(msg.get("content", ""))
-
-        if role == "assistant":
-            for tool_call in msg.get("tool_calls", []):
-                if not isinstance(tool_call, dict) or tool_call.get("type") != "function":
-                    continue
-                fn = tool_call.get("function", {})
-                fn_name = fn.get("name")
-                if not fn_name:
-                    continue
-                fn_args = _parse_openai_tool_arguments(fn.get("arguments", "{}"))
-                parts.append({"functionCall": {"name": fn_name, "args": fn_args}})
-                tool_call_id = tool_call.get("id")
-                if tool_call_id:
-                    tool_call_id_to_name[tool_call_id] = fn_name
-            contents.append({"role": "model", "parts": parts or [{"text": ""}]})
-            continue
-
-        if role == "tool":
-            fn_name = msg.get("name") or tool_call_id_to_name.get(msg.get("tool_call_id"), "tool")
-            tool_resp = _parse_tool_message_content(msg.get("content", ""))
-            parts = [{"functionResponse": {"name": fn_name, "response": tool_resp}}]
-            contents.append({"role": "user", "parts": parts})
-            continue
-
-        contents.append({"role": "user", "parts": parts or [{"text": ""}]})
-
-    google_body = {"contents": contents}
-    if system_parts:
-        google_body["systemInstruction"] = {"parts": system_parts}
-
-    generation_config = _build_generation_config(body)
-    if generation_config:
-        google_body["generationConfig"] = generation_config
-
-    tools = _build_tools(body.get("tools", []))
-    if tools:
-        google_body["tools"] = tools
-
-    tool_config = _build_tool_config(body.get("tool_choice"))
-    if tool_config:
-        google_body["toolConfig"] = tool_config
-
-    return google_body
-
-
-def call_google(key, model, body, via_cf=True, stream=False, action=None, url_model=None, api_version="v1beta"):
-    """model is for body/display, url_model is for URL path (defaults to model)."""
-    if action is None:
-        action = "streamGenerateContent" if stream else "generateContent"
-    google_url_model = url_model or model
-    if via_cf and CF_API_TOKEN:
+# ── Google API call ──────────────────────────────────────────────────────────
+def call_google(key, model, body, action="generateContent", stream=False):
+    use_cf = bool(CF_API_TOKEN)
+    if use_cf:
         url = (f"https://gateway.ai.cloudflare.com/v1/{CF_ACCOUNT_ID}/{CF_GATEWAY_ID}/"
-               f"google-ai-studio/{api_version}/models/{google_url_model}:{action}"
+               f"google-ai-studio/v1beta/models/{model}:{action}"
                f"{'?alt=sse' if stream else ''}")
         headers = {
             "Content-Type": "application/json",
@@ -300,224 +118,261 @@ def call_google(key, model, body, via_cf=True, stream=False, action=None, url_mo
             "Authorization": f"Bearer {CF_API_TOKEN}",
         }
     else:
-        url = f"https://generativelanguage.googleapis.com/{api_version}/models/{google_url_model}:{action}"
+        url = (f"https://generativelanguage.googleapis.com/v1beta/"
+               f"models/{model}:{action}{'?alt=sse' if stream else ''}")
         headers = {"Content-Type": "application/json", "x-goog-api-key": key}
+
     resp = requests.post(url, headers=headers, json=body, timeout=TIMEOUT, stream=stream)
     return resp
 
 
-def call_chain(body, model=None, via_cf=True, stream=False, api_version="v1beta"):
-    """Try all keys in round-robin order. Returns (Response, model, key_hint)."""
-    global req_count
-    start_idx = req_count % len(API_KEYS)
-    req_count += 1
-    for offset in range(len(API_KEYS)):
-        idx = (start_idx + offset) % len(API_KEYS)
-        key = API_KEYS[idx]
-        key_hint = key[:10] + "..."
-        t0 = time.time()
-        try:
-            resp = call_google(key, model, body, via_cf, stream, api_version=api_version)
-            duration = int((time.time() - t0) * 1000)
-            status = resp.status_code
-            log_request("POST", request.path, model, status, duration, key_hint)
-            if resp.ok:
-                return resp, model, key_hint
-            # 429 = rate limit → skip to next key immediately
-            if status == 429:
-                print(f"  [key:{idx}] 429 rate limit, skipping")
-                continue
-            # Other errors → still return to client (could be upstream bug)
-            return resp, model, key_hint
-        except requests.exceptions.Timeout:
-            duration = int((time.time() - t0) * 1000)
-            log_request("POST", request.path, model, 504, duration, key_hint)
-            print(f"  [key:{idx}] timeout after {duration}ms, skip")
+# ── Message conversion ───────────────────────────────────────────────────────
+def openai_to_google(body):
+    contents = []
+    system = ""
+    for msg in body.get("messages", []):
+        role = msg.get("role")
+        if role == "system":
+            system += ("\n" if system else "") + msg.get("content", "")
             continue
-        except Exception as e:
-            duration = int((time.time() - t0) * 1000)
-            log_request("POST", request.path, model, 503, duration, key_hint)
-            print(f"  [key:{idx}] {type(e).__name__}: {e}, skip")
+
+        # assistant 消息带 tool_calls → functionCall parts
+        if role == "assistant" and msg.get("tool_calls"):
+            parts = []
+            if msg.get("content"):
+                parts.append({"text": msg["content"]})
+            for tc in msg["tool_calls"]:
+                if tc.get("type") == "function" and tc.get("function"):
+                    import json as _json
+                    try:
+                        args = _json.loads(tc["function"].get("arguments", "{}"))
+                    except Exception:
+                        args = {}
+                    parts.append({"functionCall": {"name": tc["function"]["name"], "args": args}})
+            contents.append({"role": "model", "parts": parts})
             continue
-    return None, model, None
+
+        # tool 消息 → functionResponse parts
+        if role == "tool":
+            import json as _json
+            resp_content = msg.get("content", "")
+            try:
+                resp_content = _json.loads(resp_content)
+            except Exception:
+                pass
+            contents.append({
+                "role": "user",
+                "parts": [{"functionResponse": {"name": msg.get("name", "unknown"), "response": {"result": resp_content}}}]
+            })
+            continue
+
+        content = msg.get("content", "")
+        parts = []
+        if isinstance(content, str):
+            parts.append({"text": content})
+        elif isinstance(content, list):
+            for part in content:
+                if part.get("type") == "text":
+                    parts.append({"text": part.get("text", "")})
+                elif part.get("type") == "image_url":
+                    url = part.get("image_url", {}).get("url", "")
+                    if url.startswith("data:"):
+                        import base64
+                        import re
+                        m = re.match(r"data:([^;]+);base64,(.+)", url)
+                        if m:
+                            parts.append({"inlineData": {"mimeType": m.group(1), "data": m.group(2)}})
+                    else:
+                        parts.append({"text": f"[image: {url}]"})
+        contents.append({"role": "model" if role == "assistant" else "user", "parts": parts})
+
+    if system and contents:
+        first = contents[0]
+        if first["parts"] and "text" in first["parts"][0]:
+            first["parts"][0]["text"] = system + "\n\n" + first["parts"][0]["text"]
+        elif first["parts"]:
+            first["parts"].insert(0, {"text": system})
+        else:
+            first["parts"] = [{"text": system}]
+
+    config = {}
+    if body.get("max_tokens") is not None:
+        config["maxOutputTokens"] = body["max_tokens"]
+    if body.get("temperature") is not None:
+        config["temperature"] = body["temperature"]
+    if body.get("top_p") is not None:
+        config["topP"] = body["top_p"]
+    if body.get("top_k") is not None:
+        config["topK"] = body["top_k"]
+    if body.get("stop"):
+        config["stopSequences"] = body["stop"] if isinstance(body["stop"], list) else [body["stop"]]
+    if body.get("response_format"):
+        rf = body["response_format"]
+        if rf.get("type") == "json_object":
+            config["responseMimeType"] = "application/json"
+        elif rf.get("type") == "json_schema":
+            config["responseMimeType"] = "application/json"
+            if rf.get("json_schema", {}).get("schema"):
+                config["responseSchema"] = rf["json_schema"]["schema"]
+
+    result = {"contents": contents}
+    if config:
+        result["generationConfig"] = config
+
+    # OpenAI tools → Google functionDeclarations + 搜索接地
+    tools = []
+    search_tool_names = {"google_search", "google_search_retrieval"}
+    if body.get("tools"):
+        declarations = []
+        for t in body["tools"]:
+            if t.get("type") == "function" and t.get("function"):
+                if t["function"].get("name") not in search_tool_names:
+                    declarations.append({
+                        "name": t["function"]["name"],
+                        "description": t["function"].get("description", ""),
+                        "parameters": t["function"].get("parameters", {}),
+                    })
+        if declarations:
+            tools.append({"functionDeclarations": declarations})
+
+    # web_search_options → Google 搜索接地
+    if body.get("web_search_options"):
+        ctx = body["web_search_options"].get("search_context_size", "medium")
+        if ctx == "high":
+            tools.append({"googleSearchRetrieval": {"dynamicRetrievalConfig": {"mode": "MODE_DYNAMIC", "dynamicThreshold": 0.3}}})
+        else:
+            tools.append({"googleSearch": {}})
+
+    # tools 中包含 google_search / web_search 特殊标记
+    if body.get("tools"):
+        for t in body["tools"]:
+            if t.get("type") == "function" and t.get("function", {}).get("name") == "google_search":
+                tools.append({"googleSearch": {}})
+            if t.get("type") == "function" and t.get("function", {}).get("name") == "google_search_retrieval":
+                tools.append({"googleSearchRetrieval": t["function"].get("parameters", {"dynamicRetrievalConfig": {"mode": "MODE_DYNAMIC", "dynamicThreshold": 0.5}})})
+
+    if tools:
+        result["tools"] = tools
+    return result
 
 
-# ── Routes ───────────────────────────────────────────────────────────────────
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "keys": len(API_KEYS)})
+def to_openai(google_resp, model):
+    c = google_resp.get("candidates", [{}])[0] if google_resp.get("candidates") else {}
+    usage = google_resp.get("usageMetadata", {})
+    finish = c.get("finishReason") or "STOP"
+    parts = c.get("content", {}).get("parts", [])
 
+    message = {"role": "assistant"}
+    text_parts = [p for p in parts if p.get("text")]
+    func_parts = [p for p in parts if p.get("functionCall")]
 
-@app.route("/logs", methods=["GET"])
-def logs():
-    limit = int(request.args.get("limit", 50))
-    out = []
-    for entry in reversed(request_log[-limit:]):
-        out.append({
-            "timestamp": entry[0], "method": entry[1], "path": entry[2],
-            "model": entry[3], "status": entry[4],
-            "duration_ms": entry[5], "key_hint": entry[6],
-        })
-    return jsonify(out)
+    if text_parts:
+        message["content"] = "".join(p["text"] for p in text_parts)
+    elif not func_parts:
+        message["content"] = ""
 
+    # Google functionCall → OpenAI tool_calls
+    if func_parts:
+        message["tool_calls"] = [{
+            "id": f"call_{random.randint(10**24, 10**25)}",
+            "type": "function",
+            "function": {
+                "name": p["functionCall"]["name"],
+                "arguments": json.dumps(p["functionCall"].get("args", {})),
+            },
+        } for p in func_parts]
+        if "content" not in message:
+            message["content"] = None
 
-@app.route("/v1/models", methods=["GET"])
-def list_models():
-    return jsonify({
-        "object": "list", "data": [
-            {"id": "gemini-2.5-flash", "object": "model", "created": 0, "owned_by": "google"},
-            {"id": "gemini-3.1-flash-lite", "object": "model", "created": 0, "owned_by": "google"},
-            {"id": "gemma-4-31b-it", "object": "model", "created": 0, "owned_by": "google"},
-            {"id": "gemma-4-26b-a4b-it", "object": "model", "created": 0, "owned_by": "google"},
-            {"id": "embedding-2", "object": "model", "created": 0, "owned_by": "google"},
-        ]})
-
-
-@app.route("/v1/embeddings", methods=["POST"])
-def embeddings():
-    print(f"[EMBED] headers={dict(request.headers)}, raw_data={request.get_data()}")
-    err = auth_check()
-    if err:
-        return err
-    try:
-        body = request.get_json()
-    except:
-        print(f"[EMBED] invalid JSON: {request.get_data()}")
-        return jsonify({"error": {"message": "Invalid JSON"}}), 400
-
-    model = body.get("model", "gemini-embedding-2")
-    input_texts = body.get("input", [])
-    if isinstance(input_texts, str):
-        input_texts = [input_texts]
-
-    # Map embedding-2 → gemini-embedding-2-preview (the actual model name)
-    google_model = "gemini-embedding-2-preview" if model == "embedding-2" else model
-
-    # Convert to Gemini batchEmbedContents format
-    gemini_body = {
-        "requests": [
-            {"model": f"models/{google_model}",
-             "content": {"parts": [{"text": t}]}}
-            for t in input_texts
-        ]
+    result = {
+        "id": f"chatcmpl-{random.randint(10**24, 10**25)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "message": message,
+                     "finish_reason": FINISH_MAP.get(finish, "stop")}],
+        "usage": {"prompt_tokens": usage.get("promptTokenCount", 0),
+                  "completion_tokens": usage.get("candidatesTokenCount", 0),
+                  "total_tokens": usage.get("totalTokenCount", 0)},
     }
 
-    # Try each key
-    start_idx = req_count % len(API_KEYS)
+    # Google 搜索接地 → search_results
+    gm = c.get("groundingMetadata")
+    if gm:
+        search_results = [{"url": ch["web"]["uri"], "title": ch["web"]["title"]}
+                          for ch in gm.get("groundingChunks", []) if ch.get("web")]
+        if search_results:
+            result["search_results"] = search_results
+        queries = gm.get("webSearchQueries")
+        if queries:
+            result["search_queries"] = queries
+
+    return result
+
+
+# ── Fallback engine ──────────────────────────────────────────────────────────
+def build_chains():
+    key_start = random.randint(0, len(API_KEYS) - 1)
+    primary = [{"key": API_KEYS[(key_start + i) % len(API_KEYS)], "model": m}
+               for i, m in enumerate(PRIMARY_MODELS)]
+    fallback = [{"key": API_KEYS[(key_start + i) % len(API_KEYS)], "model": m}
+                for i, m in enumerate(FALLBACK_MODELS)]
+    return primary, fallback
+
+
+def with_fallback(fn):
+    """Try primary chain then fallback chain. fn(key, model) → result or raise."""
+    primary, fallback = build_chains()
     last_error = None
-    for offset in range(len(API_KEYS)):
-        idx = (start_idx + offset) % len(API_KEYS)
-        key = API_KEYS[idx]
-        key_hint = key[:10] + "..."
-        t0 = time.time()
-        try:
-            resp = call_google(key, model, gemini_body, via_cf=False, stream=False, action="batchEmbedContents", url_model=google_model)
-            duration = int((time.time() - t0) * 1000)
-            log_request("POST", "/v1/embeddings", model, resp.status_code, duration, key_hint)
-            if resp.ok:
-                data = resp.json()
-                embeddings_data = data.get("embeddings", [])
-                usage_meta = data.get("usageMetadata", {})
-                return jsonify({
-                    "object": "list",
-                    "data": [
-                        {"object": "embedding", "index": i, "embedding": e.get("values", [])}
-                        for i, e in enumerate(embeddings_data)
-                    ],
-                    "model": model,
-                    "usage": {
-                        "prompt_tokens": usage_meta.get("promptTokens", 0),
-                        "total_tokens": usage_meta.get("totalTokens", 0),
-                    },
-                })
-            if resp.status_code == 429:
+
+    for chain, label in [(primary, "primary"), (fallback, "fallback")]:
+        for item in chain:
+            key, model = item["key"], item["model"]
+            key_hint = key[:10] + "..."
+            t0 = time.time()
+            try:
+                result = fn(key, model)
+                duration = int((time.time() - t0) * 1000)
+                log_req("POST", request.path, model, 200, duration, key_hint)
+                return result, model, key_hint
+            except requests.exceptions.Timeout:
+                duration = int((time.time() - t0) * 1000)
+                log_req("POST", request.path, model, 504, duration, key_hint)
+                print(f"  [{label}:{model}] timeout {duration}ms, skip")
+                last_error = {"message": "Request timed out", "type": "timeout_error", "status": 504}
                 continue
-            last_error = resp.text
-        except Exception as e:
-            last_error = str(e)
-            continue
+            except requests.exceptions.HTTPError as e:
+                duration = int((time.time() - t0) * 1000)
+                status = e.response.status_code if e.response is not None else 503
+                log_req("POST", request.path, model, status, duration, key_hint)
+                if status == 429:
+                    print(f"  [{label}:{model}] 429 rate limited, skip")
+                    last_error = {"message": "Rate limit exceeded", "type": "rate_limit_error", "status": 429}
+                    continue
+                try:
+                    err_body = e.response.json() if e.response is not None else {}
+                except Exception:
+                    err_body = {}
+                last_error = {"message": err_body.get("error", {}).get("message", str(e)),
+                              "type": "upstream_error", "status": status,
+                              "google_error": err_body.get("error")}
+                print(f"  [{label}:{model}] HTTP {status}, skip")
+                continue
+            except Exception as e:
+                duration = int((time.time() - t0) * 1000)
+                log_req("POST", request.path, model, 503, duration, key_hint)
+                print(f"  [{label}:{model}] {type(e).__name__}: {e}")
+                last_error = {"message": str(e), "type": "fallback_exhausted", "status": 503}
+                continue
 
-    return jsonify({"error": {"message": last_error or "All keys exhausted", "type": "fallback_exhausted"}}), 503
-
-
-@app.route("/v1/chat/completions", methods=["POST"])
-@app.route("/v1/openai/chat/completions", methods=["POST"])
-@app.route("/v1beta/openai/chat/completions", methods=["POST"])
-def chat_completions():
-    err = auth_check()
-    if err:
-        return err
-    try:
-        body = request.get_json()
-    except:
-        return jsonify({"error": {"message": "Invalid JSON"}}), 400
-
-    is_stream = body.get("stream", False)
-    model = body.get("model", "gemini-2.5-flash")
-    google_body = openai_to_google(body)
-    api_version = "v1" if request.path.startswith("/v1/openai/") else "v1beta"
-
-    resp, used_model, key_hint = call_chain(google_body, model, stream=is_stream, api_version=api_version)
-    if resp is None:
-        return jsonify({"error": {"message": "All keys exhausted", "type": "fallback_exhausted"}}), 503
-
-    if is_stream:
-        return Response(
-            _stream_response(resp, used_model),
-            mimetype="text/event-stream",
-            headers={"Cache-Control": "no-cache", "x-model": used_model},
-        )
-    else:
-        data = resp.json()
-        openai_resp = to_openai(data, used_model)
-        return jsonify(openai_resp)
+    return None, None, last_error
 
 
-@app.route("/v1beta/models/<model>:generateContent", methods=["POST"])
-@app.route("/v1/models/<model>:generateContent", methods=["POST"])
-def google_generate(model):
-    return handle_google_native(model, stream=False)
-
-
-@app.route("/v1beta/models/<model>:streamGenerateContent", methods=["POST"])
-@app.route("/v1/models/<model>:streamGenerateContent", methods=["POST"])
-def google_stream_generate(model):
-    return handle_google_native(model, stream=True)
-
-
-def handle_google_native(model, stream):
-    err = auth_check()
-    if err:
-        return err
-    try:
-        body = request.get_json()
-    except:
-        return jsonify({"error": {"message": "Invalid JSON"}}), 400
-
-    api_version = "v1" if request.path.startswith("/v1/models/") else "v1beta"
-    resp, used_model, key_hint = call_chain(body, model, stream=stream, api_version=api_version)
-    if resp is None:
-        return jsonify({"error": {"message": "All keys exhausted", "type": "fallback_exhausted"}}), 503
-
-    if stream:
-        return Response(
-            _stream_raw(resp),
-            mimetype="text/event-stream",
-            headers={"Cache-Control": "no-cache", "x-model": used_model},
-        )
-    else:
-        return Response(resp.content, resp.status_code,
-                        headers={"Content-Type": resp.headers.get("Content-Type", "application/json"),
-                                 "x-model": used_model})
-
-
-def _stream_response(google_resp, model):
-    """Yield OpenAI-format SSE from Google streaming response."""
-    import json
+# ── Streaming ────────────────────────────────────────────────────────────────
+def stream_openai_sse(google_resp, model):
+    """Convert Google streaming SSE → OpenAI streaming SSE."""
     first = True
     finish_sent = False
-    tool_call_index = 0
-    completion_id = f"chatcmpl-{random.randint(10**24, 10**25)}"
     for line in google_resp.iter_lines():
         if not line:
             continue
@@ -525,97 +380,753 @@ def _stream_response(google_resp, model):
         if not line.startswith("data: "):
             continue
         raw = line[6:].strip()
-        if not raw or raw == "[DONE]":
+        if not raw:
             continue
         try:
             ev = json.loads(raw)
-        except:
+        except json.JSONDecodeError:
+            print(f"  [SSE] malformed JSON: {raw[:200]}")
             continue
-        ev_error = ev.get("error")
-        if ev_error:
-            yield f"data: {json.dumps({'error': ev_error})}\n\n"
+        if ev.get("error"):
+            yield f"data: {json.dumps({'error': ev['error']})}\n\n"
             continue
-        cand = ev.get("candidates", [{}])[0]
-        cand_parts = cand.get("content", {}).get("parts", [])
-        text = "".join(p.get("text", "") for p in cand_parts if isinstance(p, dict) and p.get("text"))
-        stream_tool_calls = []
-        for part in cand_parts:
-            if not isinstance(part, dict):
-                continue
-            fn_call = part.get("functionCall", {})
-            name = fn_call.get("name")
-            if not name:
-                continue
-            stream_tool_calls.append({
-                "index": tool_call_index,
-                "id": f"call_{random.randint(10**8, 10**10)}_{tool_call_index}",
-                "type": "function",
-                "function": {"name": name, "arguments": json.dumps(fn_call.get('args', {}), ensure_ascii=False)},
-            })
-            tool_call_index += 1
+        cand = ev.get("candidates", [{}])[0] if ev.get("candidates") else {}
+        text = cand.get("content", {}).get("parts", [{}])[0].get("text", "") if cand.get("content") else ""
         finish = cand.get("finishReason")
         usage = ev.get("usageMetadata")
-        finish_reason = FINISH_MAP.get(finish, "stop") if finish else None
-        if finish_reason == "stop" and stream_tool_calls:
-            finish_reason = "tool_calls"
         if first:
-            delta = {"role": "assistant"}
-            if text:
-                delta["content"] = text
-            if stream_tool_calls:
-                delta["tool_calls"] = stream_tool_calls
-            chunk = {"id": completion_id,
-                     "object": "chat.completion.chunk",
-                     "created": int(time.time()), "model": model,
-                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+            delta = {"role": "assistant", "content": text} if text else {"role": "assistant"}
+            chunk = _make_chunk(model, delta, None)
             yield f"data: {json.dumps(chunk)}\n\n"
             first = False
-        elif text or stream_tool_calls:
-            delta = {}
-            if text:
-                delta["content"] = text
-            if stream_tool_calls:
-                delta["tool_calls"] = stream_tool_calls
-            chunk = {"id": completion_id,
-                     "object": "chat.completion.chunk",
-                     "created": int(time.time()), "model": model,
-                     "choices": [{"index": 0, "delta": delta,
-                                  "finish_reason": None}]}
+        elif text:
+            chunk = _make_chunk(model, {"content": text}, None)
             yield f"data: {json.dumps(chunk)}\n\n"
         if finish:
             finish_sent = True
-            chunk = {"id": completion_id,
-                     "object": "chat.completion.chunk",
-                     "created": int(time.time()), "model": model,
-                     "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason or "stop"}]}
+            fr = FINISH_MAP.get(finish, "stop")
+            chunk = _make_chunk(model, {}, fr)
             yield f"data: {json.dumps(chunk)}\n\n"
+            # 搜索接地结果
+            gm = cand.get("groundingMetadata")
+            if gm:
+                search_results = [{"url": ch["web"]["uri"], "title": ch["web"]["title"]}
+                                  for ch in gm.get("groundingChunks", []) if ch.get("web")]
+                if search_results:
+                    search_chunk = {
+                        "id": f"chatcmpl-{random.randint(10**24, 10**25)}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [],
+                        "search_results": search_results,
+                        "search_queries": gm.get("webSearchQueries", []),
+                    }
+                    yield f"data: {json.dumps(search_chunk)}\n\n"
             if usage:
-                usage_chunk = {"id": completion_id,
-                              "object": "chat.completion.chunk",
-                              "created": int(time.time()), "model": model,
-                              "choices": [], "usage": {
-                                  "prompt_tokens": usage.get("promptTokenCount", 0),
-                                  "completion_tokens": usage.get("candidatesTokenCount", 0),
-                                  "total_tokens": usage.get("totalTokenCount", 0)}}
+                usage_chunk = {
+                    "id": f"chatcmpl-{random.randint(10**24, 10**25)}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": usage.get("promptTokenCount", 0),
+                        "completion_tokens": usage.get("candidatesTokenCount", 0),
+                        "total_tokens": usage.get("totalTokenCount", 0),
+                    },
+                }
                 yield f"data: {json.dumps(usage_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
     if not finish_sent:
-        chunk = {"id": completion_id,
-                 "object": "chat.completion.chunk",
-                 "created": int(time.time()), "model": model,
-                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        chunk = _make_chunk(model, {}, "stop")
         yield f"data: {json.dumps(chunk)}\n\n"
-    yield "data: [DONE]\n\n"
+        yield "data: [DONE]\n\n"
 
 
-def _stream_raw(resp):
-    """Pass-through SSE from Google streaming."""
-    for line in resp.iter_lines():
+def _make_chunk(model, delta, finish_reason):
+    return {
+        "id": f"chatcmpl-{random.randint(10**24, 10**25)}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+
+
+def stream_raw_sse(google_resp):
+    """Pass-through Google streaming SSE."""
+    for line in google_resp.iter_lines():
         if line:
-            yield line + b"\n"
+            yield line + b"\n\n"
     yield b"data: [DONE]\n\n"
 
 
+# ── Routes ───────────────────────────────────────────────────────────────────
+@app.before_request
+def handle_options():
+    if request.method == "OPTIONS":
+        resp = Response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        resp.headers["Access-Control-Max-Age"] = "86400"
+        return resp
+
+
+@app.after_request
+def add_cors(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "keys": len(API_KEYS), "models": PRIMARY_MODELS + FALLBACK_MODELS})
+
+
+@app.route("/logs", methods=["GET"])
+def logs():
+    limit = int(request.args.get("limit", 50))
+    out = []
+    for entry in reversed(request_log[-limit:]):
+        out.append({"timestamp": entry[0], "method": entry[1], "path": entry[2],
+                     "model": entry[3], "status": entry[4],
+                     "duration_ms": entry[5], "key_hint": entry[6]})
+    return jsonify(out)
+
+
+@app.route("/v1/models", methods=["GET"])
+def list_models():
+    models = [{"id": AUTO_MODEL, "object": "model", "created": 0, "owned_by": "proxy"}]
+    models.extend({"id": m, "object": "model", "created": 0, "owned_by": "google"}
+                  for m in ALL_MODELS)
+    return jsonify({"object": "list", "data": models})
+
+
+# ── OpenAI Chat Completions ──────────────────────────────────────────────────
+@app.route("/v1/chat/completions", methods=["POST"])
+def chat_completions():
+    err = auth_check()
+    if err:
+        return err
+    try:
+        body = request.get_json()
+    except Exception:
+        return json_resp({"error": {"message": "Invalid JSON"}}, 400)
+
+    if not body.get("messages") or not isinstance(body["messages"], list):
+        return json_resp({"error": {"message": "messages array required"}}, 400)
+
+    is_stream = body.get("stream", False)
+    requested_model = body.get("model", AUTO_MODEL)
+    google_body = openai_to_google(body)
+
+    if is_auto_model(requested_model):
+        # auto 模式：走完整 key × model fallback
+        def do_call(key, model):
+            resp = call_google(key, model, google_body, stream=is_stream)
+            resp.raise_for_status()
+            return resp
+
+        result, used_model, info = with_fallback(do_call)
+        if result is None:
+            status = info.get("status", 503) if isinstance(info, dict) else 503
+            return json_resp({"error": info or {"message": "All keys/models exhausted"}}, status)
+    else:
+        # 指定模型：只做 key 轮询
+        used_model = requested_model
+        result = None
+        last_error = None
+        start_idx = next_key_offset()
+        for offset in range(len(API_KEYS)):
+            idx = (start_idx + offset) % len(API_KEYS)
+            key = API_KEYS[idx]
+            key_hint = key[:10] + "..."
+            t0 = time.time()
+            try:
+                resp = call_google(key, requested_model, google_body, stream=is_stream)
+                resp.raise_for_status()
+                duration = int((time.time() - t0) * 1000)
+                log_req("POST", "/v1/chat/completions", requested_model, 200, duration, key_hint)
+                result = resp
+                break
+            except requests.exceptions.Timeout:
+                duration = int((time.time() - t0) * 1000)
+                log_req("POST", "/v1/chat/completions", requested_model, 504, duration, key_hint)
+                last_error = {"message": "Request timed out", "type": "timeout_error", "status": 504}
+                continue
+            except requests.exceptions.HTTPError as e:
+                duration = int((time.time() - t0) * 1000)
+                status = e.response.status_code if e.response is not None else 503
+                log_req("POST", "/v1/chat/completions", requested_model, status, duration, key_hint)
+                if status == 429:
+                    last_error = {"message": "Rate limit exceeded", "type": "rate_limit_error", "status": 429}
+                    continue
+                last_error = {"message": str(e), "type": "upstream_error", "status": status}
+                continue
+            except Exception as e:
+                duration = int((time.time() - t0) * 1000)
+                log_req("POST", "/v1/chat/completions", requested_model, 503, duration, key_hint)
+                last_error = {"message": str(e), "type": "fallback_exhausted", "status": 503}
+                continue
+
+        if result is None:
+            status = last_error.get("status", 503) if isinstance(last_error, dict) else 503
+            return json_resp({"error": last_error or {"message": "All keys exhausted"}}, status)
+
+    if is_stream:
+        return Response(
+            stream_openai_sse(result, used_model),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "x-model": used_model,
+                     "Access-Control-Allow-Origin": "*"},
+        )
+    else:
+        data = result.json()
+        return json_resp(to_openai(data, used_model), extra_headers={"x-model": used_model})
+
+
+# ── OpenAI Embeddings ────────────────────────────────────────────────────────
+@app.route("/v1/embeddings", methods=["POST"])
+def embeddings():
+    err = auth_check()
+    if err:
+        return err
+    try:
+        body = request.get_json()
+    except Exception:
+        return json_resp({"error": {"message": "Invalid JSON"}}, 400)
+
+    if body.get("stream"):
+        return json_resp({"error": {"message": "Streaming not supported for embeddings"}}, 400)
+
+    model = body.get("model", "gemini-embedding-2")
+    input_texts = body.get("input", body.get("input_array", ""))
+    if isinstance(input_texts, str):
+        input_texts = [input_texts]
+
+    gemini_body = {
+        "requests": [{"model": f"models/{model}", "content": {"parts": [{"text": str(t)}]}}
+                     for t in input_texts]
+    }
+
+    start_idx = next_key_offset()
+    last_error = None
+    for offset in range(len(API_KEYS)):
+        idx = (start_idx + offset) % len(API_KEYS)
+        key = API_KEYS[idx]
+        key_hint = key[:10] + "..."
+        t0 = time.time()
+        try:
+            resp = call_google(key, model, gemini_body, action="batchEmbedContents", stream=False)
+            duration = int((time.time() - t0) * 1000)
+            log_req("POST", "/v1/embeddings", model, resp.status_code, duration, key_hint)
+            if resp.ok:
+                data = resp.json()
+                embeddings_data = data.get("embeddings", [])
+                return json_resp({
+                    "object": "list",
+                    "data": [{"object": "embedding", "index": i, "embedding": e.get("values", [])}
+                             for i, e in enumerate(embeddings_data)],
+                    "model": model,
+                    "usage": {"prompt_tokens": 0, "total_tokens": 0},
+                }, extra_headers={"x-model": model})
+            if resp.status_code == 429:
+                print(f"  [embedding:{model}] 429 rate limited, skip")
+                last_error = "Rate limit exceeded"
+                continue
+            last_error = resp.text[:500]
+        except Exception as e:
+            duration = int((time.time() - t0) * 1000)
+            log_req("POST", "/v1/embeddings", model, 503, duration, key_hint)
+            last_error = str(e)
+            continue
+
+    return json_resp({"error": {"message": last_error or "All keys exhausted",
+                                 "type": "fallback_exhausted"}}, 503)
+
+
+# ── Google Native API ────────────────────────────────────────────────────────
+@app.route("/v1beta/models/<model>:generateContent", methods=["POST"])
+def google_generate(model):
+    return _handle_google_native(model, stream=False)
+
+
+@app.route("/v1beta/models/<model>:streamGenerateContent", methods=["POST"])
+def google_stream(model):
+    return _handle_google_native(model, stream=True)
+
+
+@app.route("/v1beta/models/<model>:batchEmbedContents", methods=["POST"])
+def google_embed(model):
+    err = auth_check()
+    if err:
+        return err
+    try:
+        body = request.get_json()
+    except Exception:
+        return json_resp({"error": {"message": "Invalid JSON"}}, 400)
+
+    start_idx = next_key_offset()
+    last_error = None
+    for offset in range(len(API_KEYS)):
+        idx = (start_idx + offset) % len(API_KEYS)
+        key = API_KEYS[idx]
+        key_hint = key[:10] + "..."
+        t0 = time.time()
+        try:
+            resp = call_google(key, model, body, action="batchEmbedContents", stream=False)
+            duration = int((time.time() - t0) * 1000)
+            log_req("POST", request.path, model, resp.status_code, duration, key_hint)
+            if resp.ok:
+                return Response(resp.content, resp.status_code,
+                                headers={"Content-Type": "application/json",
+                                         "x-model": model,
+                                         "Access-Control-Allow-Origin": "*"})
+            if resp.status_code == 429:
+                continue
+            last_error = resp.text[:500]
+        except Exception as e:
+            duration = int((time.time() - t0) * 1000)
+            log_req("POST", request.path, model, 503, duration, key_hint)
+            last_error = str(e)
+            continue
+
+    return json_resp({"error": {"message": last_error or "All keys exhausted"}}, 503)
+
+
+def _handle_google_native(model, stream):
+    err = auth_check()
+    if err:
+        return err
+    try:
+        body = request.get_json()
+    except Exception:
+        return json_resp({"error": {"message": "Invalid JSON"}}, 400)
+
+    def _respond(resp, used_model):
+        if stream:
+            return Response(
+                stream_raw_sse(resp),
+                mimetype="text/event-stream",
+                headers={"Cache-Control": "no-cache", "x-model": used_model,
+                         "Access-Control-Allow-Origin": "*"},
+            )
+        else:
+            return Response(resp.content, resp.status_code,
+                            headers={"Content-Type": resp.headers.get("Content-Type", "application/json"),
+                                     "x-model": used_model,
+                                     "Access-Control-Allow-Origin": "*"})
+
+    # auto 模式：走完整 key × model fallback
+    if is_auto_model(model):
+        def do_call(key, m):
+            resp = call_google(key, m, body, stream=stream)
+            resp.raise_for_status()
+            return resp
+
+        result, used_model, info = with_fallback(do_call)
+        if result is None:
+            status = info.get("status", 503) if isinstance(info, dict) else 503
+            return json_resp({"error": info or {"message": "All keys/models exhausted"}}, status)
+        return _respond(result, used_model)
+
+    # 指定模型：只做 key 轮询
+    start_idx = next_key_offset()
+    last_error = None
+    for offset in range(len(API_KEYS)):
+        idx = (start_idx + offset) % len(API_KEYS)
+        key = API_KEYS[idx]
+        key_hint = key[:10] + "..."
+        t0 = time.time()
+        try:
+            resp = call_google(key, model, body, stream=stream)
+            resp.raise_for_status()
+            duration = int((time.time() - t0) * 1000)
+            log_req("POST", request.path, model, 200, duration, key_hint)
+            return _respond(resp, model)
+        except requests.exceptions.Timeout:
+            duration = int((time.time() - t0) * 1000)
+            log_req("POST", request.path, model, 504, duration, key_hint)
+            print(f"  [google:{model}] timeout {duration}ms, skip")
+            last_error = {"message": "Request timed out", "type": "timeout_error", "status": 504}
+            continue
+        except requests.exceptions.HTTPError as e:
+            duration = int((time.time() - t0) * 1000)
+            status = e.response.status_code if e.response is not None else 503
+            log_req("POST", request.path, model, status, duration, key_hint)
+            if status == 429:
+                print(f"  [google:{model}] 429 rate limited, skip")
+                last_error = {"message": "Rate limit exceeded", "type": "rate_limit_error", "status": 429}
+                continue
+            try:
+                err_body = e.response.json() if e.response is not None else {}
+            except Exception:
+                err_body = {}
+            last_error = {"message": err_body.get("error", {}).get("message", str(e)),
+                          "type": "upstream_error", "status": status,
+                          "google_error": err_body.get("error")}
+            print(f"  [google:{model}] HTTP {status}, skip")
+            continue
+        except Exception as e:
+            duration = int((time.time() - t0) * 1000)
+            log_req("POST", request.path, model, 503, duration, key_hint)
+            print(f"  [google:{model}] {type(e).__name__}: {e}")
+            last_error = {"message": str(e), "type": "fallback_exhausted", "status": 503}
+            continue
+
+    status = last_error.get("status", 503) if isinstance(last_error, dict) else 503
+    return json_resp({"error": last_error or {"message": "All keys exhausted"}}, status)
+
+
+# ── Responses API ──────────────────────────────────────────────────────────
+
+def _resp_id():
+    return f"resp_{random.randint(10**24, 10**25)}"
+
+
+def _msg_id():
+    return f"msg_{random.randint(10**24, 10**25)}"
+
+
+def responses_input_to_messages(inp, instructions):
+    msgs = []
+    if instructions:
+        msgs.append({"role": "system", "content": instructions})
+
+    if isinstance(inp, str):
+        msgs.append({"role": "user", "content": inp})
+        return msgs
+
+    if not isinstance(inp, list):
+        return msgs
+
+    for item in inp:
+        if isinstance(item, str):
+            msgs.append({"role": "user", "content": item})
+            continue
+
+        # EasyInputMessage
+        if item.get("role") and "content" in item:
+            role = "system" if item["role"] == "developer" else item["role"]
+            content = item["content"]
+            if isinstance(content, str):
+                msgs.append({"role": role, "content": content})
+            elif isinstance(content, list):
+                parts = []
+                for p in content:
+                    if p.get("type") in ("input_text", "text"):
+                        parts.append({"type": "text", "text": p.get("text", "")})
+                    elif p.get("type") == "input_image":
+                        parts.append({"type": "image_url", "image_url": {"url": p.get("image_url", p.get("url", ""))}})
+                msgs.append({"role": role, "content": parts})
+            continue
+
+        # ResponseOutputMessage
+        if item.get("type") == "message":
+            role = item.get("role", "user")
+            text = "".join(c.get("text", "") for c in item.get("content", []) if c.get("type") in ("output_text", "input_text"))
+            if text:
+                msgs.append({"role": role, "content": text})
+            continue
+
+        # FunctionCall
+        if item.get("type") == "function_call":
+            msgs.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": item.get("call_id", item.get("id")),
+                    "type": "function",
+                    "function": {"name": item["name"], "arguments": item.get("arguments", "{}")},
+                }],
+            })
+            continue
+
+        # FunctionCallOutput
+        if item.get("type") == "function_call_output":
+            output = item.get("output", "")
+            if not isinstance(output, str):
+                output = json.dumps(output)
+            msgs.append({
+                "role": "tool",
+                "tool_call_id": item.get("call_id"),
+                "content": output,
+            })
+            continue
+
+    return msgs
+
+
+def responses_tools_to_chat_tools(tools):
+    if not tools:
+        return None
+    result = []
+    for t in tools:
+        if t.get("type") == "function":
+            # Responses API 格式: name 在顶层
+            # Chat Completions 格式: name 在 function 下
+            name = t.get("name") or t.get("function", {}).get("name", "")
+            desc = t.get("description") or t.get("function", {}).get("description", "")
+            params = t.get("parameters") or t.get("function", {}).get("parameters", {})
+            result.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": desc,
+                    "parameters": params,
+                },
+            })
+    return result if result else None
+
+
+def chat_response_to_responses(chat_resp, response_id):
+    msg = chat_resp.get("choices", [{}])[0].get("message", {})
+    finish = chat_resp.get("choices", [{}])[0].get("finish_reason")
+    output = []
+
+    # 搜索接地 → url_citation annotations
+    annotations = []
+    for sr in chat_resp.get("search_results", []):
+        annotations.append({"type": "url_citation", "url": sr["url"], "title": sr["title"]})
+
+    if msg.get("tool_calls"):
+        for tc in msg["tool_calls"]:
+            output.append({
+                "type": "function_call",
+                "id": tc.get("id"),
+                "call_id": tc.get("id"),
+                "name": tc.get("function", {}).get("name"),
+                "arguments": tc.get("function", {}).get("arguments", "{}"),
+                "status": "completed",
+            })
+    else:
+        output.append({
+            "type": "message",
+            "id": _msg_id(),
+            "status": "completed" if finish == "stop" else "incomplete",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": msg.get("content", ""), "annotations": annotations}],
+        })
+
+    usage = chat_resp.get("usage", {})
+    result = {
+        "id": response_id,
+        "object": "response",
+        "created_at": chat_resp.get("created", int(time.time())),
+        "completed_at": int(time.time()),
+        "status": "completed" if finish in ("stop", "tool_calls") else "incomplete",
+        "model": chat_resp.get("model"),
+        "output": output,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        },
+    }
+
+    if chat_resp.get("search_queries"):
+        result["search_queries"] = chat_resp["search_queries"]
+
+    return result
+
+
+def stream_responses_sse(google_resp, model, response_id):
+    """Convert Google streaming SSE → Responses API streaming SSE."""
+    item_id = _msg_id()
+    full_text = ""
+
+    yield _sse_event("response.created", {
+        "type": "response.created",
+        "response": {"id": response_id, "object": "response", "created_at": int(time.time()),
+                      "status": "in_progress", "model": model, "output": [],
+                      "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}},
+    })
+
+    yield _sse_event("response.in_progress", {
+        "type": "response.in_progress",
+        "response": {"id": response_id, "object": "response", "created_at": int(time.time()),
+                      "status": "in_progress", "model": model, "output": [],
+                      "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}},
+    })
+
+    yield _sse_event("response.output_item.added", {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {"type": "message", "id": item_id, "status": "in_progress", "role": "assistant", "content": []},
+    })
+
+    yield _sse_event("response.content_part.added", {
+        "type": "response.content_part.added",
+        "output_index": 0,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": "", "annotations": []},
+    })
+
+    finish_sent = False
+    annotations = []
+    for line in google_resp.iter_lines():
+        if not line:
+            continue
+        line = line.decode("utf-8", errors="replace")
+        if not line.startswith("data: "):
+            continue
+        raw = line[6:].strip()
+        if not raw:
+            continue
+        try:
+            ev = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("error"):
+            yield _sse_event("error", {"type": "error", "message": ev["error"].get("message", "unknown")})
+            continue
+
+        cand = ev.get("candidates", [{}])[0] if ev.get("candidates") else {}
+        text = cand.get("content", {}).get("parts", [{}])[0].get("text", "") if cand.get("content") else ""
+        finish = cand.get("finishReason")
+        usage = ev.get("usageMetadata")
+
+        if text:
+            full_text += text
+            yield _sse_event("response.output_text.delta", {
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": text,
+            })
+
+        if finish:
+            finish_sent = True
+            # 提取搜索接地
+            gm = cand.get("groundingMetadata")
+            if gm:
+                for ch in gm.get("groundingChunks", []):
+                    if ch.get("web"):
+                        annotations.append({"type": "url_citation", "url": ch["web"]["uri"], "title": ch["web"]["title"]})
+
+            yield _sse_event("response.output_text.done", {
+                "type": "response.output_text.done",
+                "output_index": 0,
+                "content_index": 0,
+                "text": full_text,
+            })
+            yield _sse_event("response.content_part.done", {
+                "type": "response.content_part.done",
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": full_text, "annotations": annotations},
+            })
+            yield _sse_event("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "message", "id": item_id, "status": "completed", "role": "assistant",
+                         "content": [{"type": "output_text", "text": full_text, "annotations": annotations}]},
+            })
+
+            usage_data = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            if usage:
+                usage_data = {"input_tokens": usage.get("promptTokenCount", 0),
+                              "output_tokens": usage.get("candidatesTokenCount", 0),
+                              "total_tokens": usage.get("totalTokenCount", 0)}
+
+            yield _sse_event("response.completed", {
+                "type": "response.completed",
+                "response": {"id": response_id, "object": "response", "created_at": int(time.time()),
+                              "completed_at": int(time.time()), "status": "completed", "model": model,
+                              "output": [{"type": "message", "id": item_id, "status": "completed", "role": "assistant",
+                                          "content": [{"type": "output_text", "text": full_text, "annotations": annotations}]}],
+                              "usage": usage_data},
+            })
+
+    if not finish_sent:
+        yield _sse_event("response.completed", {
+            "type": "response.completed",
+            "response": {"id": response_id, "object": "response", "created_at": int(time.time()),
+                          "completed_at": int(time.time()), "status": "completed", "model": model,
+                          "output": [{"type": "message", "id": item_id, "status": "completed", "role": "assistant",
+                                      "content": [{"type": "output_text", "text": full_text, "annotations": annotations}]}],
+                          "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}},
+        })
+
+
+def _sse_event(event_type, data):
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.route("/v1/responses", methods=["POST"])
+def responses_api():
+    err = auth_check()
+    if err:
+        return err
+    try:
+        body = request.get_json()
+    except Exception:
+        return json_resp({"error": {"message": "Invalid JSON"}}, 400)
+
+    response_id = _resp_id()
+    is_stream = body.get("stream", False)
+    requested_model = body.get("model", AUTO_MODEL)
+    messages = responses_input_to_messages(body.get("input"), body.get("instructions"))
+    chat_tools = responses_tools_to_chat_tools(body.get("tools"))
+
+    google_body = openai_to_google({"messages": messages, "tools": chat_tools,
+                                     "temperature": body.get("temperature"),
+                                     "top_p": body.get("top_p"),
+                                     "max_tokens": body.get("max_output_tokens"),
+                                     "response_format": body.get("text", {}).get("format") if body.get("text") else None})
+
+    def do_call(key, model):
+        resp = call_google(key, model, google_body, stream=is_stream)
+        resp.raise_for_status()
+        return resp
+
+    if is_auto_model(requested_model):
+        result, used_model, info = with_fallback(do_call)
+        if result is None:
+            status = info.get("status", 503) if isinstance(info, dict) else 503
+            err_msg = info.get("message", "All keys/models exhausted") if isinstance(info, dict) else "All keys/models exhausted"
+            return Response(f"event: error\ndata: {json.dumps({'type': 'error', 'message': err_msg})}\n\n",
+                            status=status, mimetype="text/event-stream")
+    else:
+        used_model = requested_model
+        result = None
+        start_idx = next_key_offset()
+        for offset in range(len(API_KEYS)):
+            idx = (start_idx + offset) % len(API_KEYS)
+            key = API_KEYS[idx]
+            try:
+                resp = call_google(key, requested_model, google_body, stream=is_stream)
+                resp.raise_for_status()
+                result = resp
+                break
+            except Exception:
+                continue
+        if result is None:
+            return json_resp({"error": {"message": "All keys exhausted"}}, 503)
+
+    if is_stream:
+        return Response(
+            stream_responses_sse(result, used_model, response_id),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "x-model": used_model, "Access-Control-Allow-Origin": "*"},
+        )
+    else:
+        data = result.json()
+        chat_resp = to_openai(data, used_model)
+        resp_data = chat_response_to_responses(chat_resp, response_id)
+        return json_resp(resp_data, extra_headers={"x-model": used_model})
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print(f"Starting local proxy on :{PORT}")
     print(f"Keys: {len(API_KEYS)} ({API_KEYS[0][:10]}... etc)")
+    print(f"Primary: {PRIMARY_MODELS}")
+    print(f"Fallback: {FALLBACK_MODELS}")
+    if CF_API_TOKEN:
+        print(f"Via Cloudflare Gateway: {CF_ACCOUNT_ID}/{CF_GATEWAY_ID}")
+    else:
+        print("Direct to Google API (no CF gateway)")
     app.run(host="0.0.0.0", port=PORT, threaded=True)

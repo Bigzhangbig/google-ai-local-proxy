@@ -1,11 +1,9 @@
 [project]
-name = "local-llm-proxy"
-version = "0.1.0"
-private = true
-dependencies = [
-    "flask>=3.1.1",
-    "requests>=2.32.3",
-]
+name = "google-ai-local-proxy"
+version = "2.0.0"
+description = "Local proxy: multi-key × multi-model fallback for Google AI"
+requires-python = ">=3.10"
+dependencies = ["flask>=3.0", "requests>=2.31"]
 
 [project.scripts]
-run = "server:app"
+proxy = "server:app"
